@@ -2,10 +2,12 @@
 Base ScopedLogger class for ff-logger.
 """
 
+import contextlib
 import logging
+import threading
 from typing import Any
 
-from .utils import normalize_level
+from .utils import _resolve, _sanitize_keys, normalize_level
 
 
 class ScopedLogger:
@@ -29,6 +31,7 @@ class ScopedLogger:
         self.name = name
         self.level = normalize_level(level)  # Normalize and store as int
         self.context = context or {}
+        self._lock = threading.RLock()  # Thread-safe context updates
 
         # Create a unique logger instance
         self.logger = logging.getLogger(name)
@@ -52,7 +55,7 @@ class ScopedLogger:
 
     def bind(self, **kwargs) -> "ScopedLogger":
         """
-        Add additional context fields to this logger instance.
+        Add additional context fields to this logger instance (thread-safe).
 
         Args:
             **kwargs: Additional context fields to bind
@@ -78,10 +81,45 @@ class ScopedLogger:
                     f"Got type: {type(value).__name__}"
                 )
 
-        self.context.update(kwargs)
+        with self._lock:
+            self.context.update(kwargs)
         return self
 
-    def _log_with_context(self, level: int, message: str, exc_info: bool = False, **kwargs):
+    @contextlib.contextmanager
+    def temp_context(self, **kwargs):
+        """
+        Temporarily add context fields for a block without permanent binding.
+
+        Args:
+            **kwargs: Temporary context fields
+
+        Yields:
+            Self for logging within the context
+        """
+        with self._lock:
+            old = {}
+            for k, v in kwargs.items():
+                if k in self.context:
+                    old[k] = self.context[k]
+                self.context[k] = v
+        try:
+            yield self
+        finally:
+            with self._lock:
+                for k in kwargs:
+                    if k in old:
+                        self.context[k] = old[k]
+                    else:
+                        self.context.pop(k, None)
+
+    def _log_with_context(
+        self,
+        level: int,
+        message: str,
+        *args: Any,
+        exc_info: Any = False,
+        **kwargs,
+    ):
         """
         Internal method to log with context.
 
@@ -91,27 +129,32 @@ class ScopedLogger:
             exc_info: Whether to include exception information
             **kwargs: Additional context fields for this log entry
         """
-        from .utils import RESERVED_FIELDS
+        # Fast level guard - skip work if level is disabled
+        if level < self.level:
+            return
+
+        # Resolve lazy values (callables)
+        resolved_kwargs = {k: _resolve(v) for k, v in kwargs.items()}
 
         # Merge permanent context with runtime kwargs
-        extra = {**self.context, **kwargs}
+        with self._lock:
+            extra = {**self.context, **resolved_kwargs}
 
-        # Remove exc_info from extra if present (it's a special parameter)
-        extra.pop("exc_info", None)
-
-        # Prefix any reserved fields to avoid conflicts with LogRecord
-        safe_extra = {}
-        for key, value in extra.items():
-            if key in RESERVED_FIELDS:
-                safe_extra[f"x_{key}"] = value
-            else:
-                safe_extra[key] = value
+        # Sanitize reserved field names for LogRecord conflicts
+        safe_extra = _sanitize_keys(extra)
 
         # Use stacklevel=3 to get the correct line number from calling code
         # Stack: calling_code -> logger.info() -> _log_with_context() -> logger.log()
-        self.logger.log(level, message, extra=safe_extra, exc_info=exc_info, stacklevel=3)
+        self.logger.log(
+            level,
+            message,
+            *args,
+            extra=safe_extra,
+            exc_info=exc_info,
+            stacklevel=3,
+        )
 
-    def debug(self, message: str, **kwargs):
+    def debug(self, message: str, *args, **kwargs):
         """
         Log a debug message.
 
@@ -119,9 +162,11 @@ class ScopedLogger:
             message: The log message
             **kwargs: Additional context fields
         """
-        self._log_with_context(logging.DEBUG, message, **kwargs)
+        # Filter out parameter conflicts before calling _log_with_context
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("level", "message", "exc_info")}
+        self._log_with_context(logging.DEBUG, message, *args, **kwargs)
 
-    def info(self, message: str, **kwargs):
+    def info(self, message: str, *args, **kwargs):
         """
         Log an info message.
 
@@ -129,9 +174,11 @@ class ScopedLogger:
             message: The log message
             **kwargs: Additional context fields
         """
-        self._log_with_context(logging.INFO, message, **kwargs)
+        # Filter out parameter conflicts before calling _log_with_context
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("level", "message", "exc_info")}
+        self._log_with_context(logging.INFO, message, *args, **kwargs)
 
-    def warning(self, message: str, **kwargs):
+    def warning(self, message: str, *args, **kwargs):
         """
         Log a warning message.
 
@@ -139,9 +186,11 @@ class ScopedLogger:
             message: The log message
             **kwargs: Additional context fields
         """
-        self._log_with_context(logging.WARNING, message, **kwargs)
+        # Filter out parameter conflicts before calling _log_with_context
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("level", "message", "exc_info")}
+        self._log_with_context(logging.WARNING, message, *args, **kwargs)
 
-    def error(self, message: str, **kwargs):
+    def error(self, message: str, *args, **kwargs):
         """
         Log an error message.
 
@@ -149,9 +198,11 @@ class ScopedLogger:
             message: The log message
             **kwargs: Additional context fields
         """
-        self._log_with_context(logging.ERROR, message, **kwargs)
+        # Filter out parameter conflicts before calling _log_with_context
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("level", "message", "exc_info")}
+        self._log_with_context(logging.ERROR, message, *args, **kwargs)
 
-    def critical(self, message: str, **kwargs):
+    def critical(self, message: str, *args, **kwargs):
         """
         Log a critical message.
 
@@ -159,9 +210,11 @@ class ScopedLogger:
             message: The log message
             **kwargs: Additional context fields
         """
-        self._log_with_context(logging.CRITICAL, message, **kwargs)
+        # Filter out parameter conflicts before calling _log_with_context
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("level", "message", "exc_info")}
+        self._log_with_context(logging.CRITICAL, message, *args, **kwargs)
 
-    def exception(self, message: str, **kwargs):
+    def exception(self, message: str, *args, **kwargs):
         """
         Log an exception with traceback.
 
@@ -169,4 +222,6 @@ class ScopedLogger:
             message: The log message
             **kwargs: Additional context fields
         """
-        self._log_with_context(logging.ERROR, message, exc_info=True, **kwargs)
+        # Filter out parameter conflicts before calling _log_with_context
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("level", "message", "exc_info")}
+        self._log_with_context(logging.ERROR, message, *args, exc_info=True, **kwargs)
